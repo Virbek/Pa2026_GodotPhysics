@@ -1,0 +1,25 @@
+#!/usr/bin/env python
+import os
+import sys
+
+env = SConscript("godot-cpp/SConstruct")
+
+# Ajouter nos fichiers source
+env.Append(CPPPATH=["src/"])
+sources = Glob("src/*.cpp")
+
+# Créer la bibliothèque partagée
+if env["platform"] == "macos":
+    library = env.SharedLibrary(
+        "projet-godot-physique/bin/libfallingsand.{}.{}.framework/libfallingsand.{}.{}".format(
+            env["platform"], env["target"], env["platform"], env["target"]
+        ),
+        source=sources,
+    )
+else:
+    library = env.SharedLibrary(
+        "projet-godot-physique/bin/libfallingsand{}{}".format(env["suffix"], env["SHLIBSUFFIX"]),
+        source=sources,
+    )
+
+Default(library)
