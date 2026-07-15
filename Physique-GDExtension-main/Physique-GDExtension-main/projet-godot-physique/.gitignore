@@ -1,10 +1,12 @@
 # Godot 4+ specific ignores
 .godot/
 /android/
+/godot-cpp/
 # Visual Studio
 .vs/
 **/.vs/
 *.vsidx
+../src/.vs
 
 # Compilation C++
 *.obj

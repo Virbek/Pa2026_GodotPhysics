@@ -123,8 +123,12 @@ void fragment() {
         float acid_wave = sin(TIME * 4.0 + cell.x * 0.24 + noise * 4.0) * 0.5 + 0.5;
         color = mix(vec3(0.12, 0.52, 0.015), vec3(0.62, 1.0, 0.04), acid_wave);
     } else if (id == 9) {
-        float sheen = sin(cell.x * 0.22 + TIME * 1.7 + noise * 6.0) * 0.5 + 0.5;
-        color = mix(vec3(0.045, 0.035, 0.025), vec3(0.30, 0.20, 0.045), sheen * 0.55);
+    float sheen = sin(cell.x * 0.22 + TIME * 1.7 + noise * 6.0) * 0.5 + 0.5;
+    color = mix(
+        vec3(0.18, 0.13, 0.04),
+        vec3(0.72, 0.52, 0.14),
+        0.25 + sheen * 0.65
+    );
     } else if (id == 10) {
         float vapor = sin(TIME * 2.2 + cell.x * 0.12 + cell.y * 0.19 + noise * 6.0) * 0.08;
         color = vec3(0.70, 0.82, 0.90) * (0.80 + noise * 0.20 + vapor);
