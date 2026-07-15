@@ -1,3 +1,16 @@
 # Godot 4+ specific ignores
 .godot/
 /android/
+# Visual Studio
+.vs/
+**/.vs/
+*.vsidx
+
+# Compilation C++
+*.obj
+*.pdb
+*.ilk
+
+# SCons
+.sconsign.dblite
+compile_commands.json
