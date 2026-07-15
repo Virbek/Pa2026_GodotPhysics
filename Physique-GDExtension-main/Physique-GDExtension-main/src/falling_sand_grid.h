@@ -1,7 +1,7 @@
-#pragma once
+﻿#pragma once
 
 // ============================================================================
-// FallingSandGrid — automate cellulaire 2D inspire de Noita.
+// FallingSandGrid â€” automate cellulaire 2D inspire de Noita.
 //
 // Points importants :
 //  * grille et cell_data sont deux tableaux 1D contigus ;
@@ -80,10 +80,10 @@ public:
     // L'eau compare les deux directions et peut parcourir plusieurs cellules
     // pour trouver un bord ou un trou. Cette valeur est aussi le mouvement
     // horizontal maximal de toute particule pendant une frame.
-    static const int WATER_DISPERSION = 30;
-    static const int OIL_DISPERSION = 11;
-    static const int ACID_DISPERSION = 9;
-    static const int LAVA_DISPERSION = 5;
+    static const int WATER_DISPERSION = 10;
+    static const int OIL_DISPERSION = 8;
+    static const int ACID_DISPERSION = 4;
+    static const int LAVA_DISPERSION = 2;
     static const int GAS_DISPERSION = 6;
     static const int MAX_MOVE_DISTANCE = WATER_DISPERSION;
 
@@ -150,7 +150,12 @@ private:
     // UI.
     Panel *ui_panel = nullptr;
     Label *stats_label = nullptr;
+    Button *fps_button = nullptr;
     std::map<Particle, Button *> ui_buttons;
+
+    // Le rendu peut Ãªtre plafonnÃ© Ã  60 FPS ou laissÃ© sans limite.
+    // La simulation reste dans tous les cas Ã  60 ticks par seconde.
+    bool fps_uncapped = false;
 
     static inline int get_index(int x, int y) { return y * WORLD_WIDTH + x; }
 
@@ -203,6 +208,7 @@ private:
     void setup_material();
     void setup_ui();
     void update_button_styles();
+    void update_fps_button();
     void update_stats();
 
     Vector2i mouse_to_cell() const;
@@ -219,11 +225,14 @@ public:
 
     void _ready() override;
     void _process(double delta) override;
-    void _input(const Ref<InputEvent> &event) override;
+    void _physics_process(double delta) override;
+    void _unhandled_input(const Ref<InputEvent>& event) override;
     void _draw() override;
 
     void on_particle_button_pressed(int particle_type);
+    void on_fps_button_pressed();
     void _simulate_chunk(int list_index);
 };
 
 } // namespace godot
+

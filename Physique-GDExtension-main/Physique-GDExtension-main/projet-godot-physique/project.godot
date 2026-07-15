@@ -18,3 +18,7 @@ config/name="projet_godot_physique"
 run/main_scene="uid://cifrai7uglccn"
 config/features=PackedStringArray("4.6", "Forward Plus")
 config/icon="res://icon.svg"
+
+[display]
+
+window/size/mode=4

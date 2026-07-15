@@ -1,4 +1,4 @@
-#include "falling_sand_grid.h"
+﻿#include "falling_sand_grid.h"
 
 #include <algorithm>
 #include <cmath>
@@ -215,11 +215,22 @@ FallingSandGrid::~FallingSandGrid() = default;
 void FallingSandGrid::_bind_methods() {
     ClassDB::bind_method(D_METHOD("on_particle_button_pressed", "particle_type"),
                          &FallingSandGrid::on_particle_button_pressed);
+    ClassDB::bind_method(D_METHOD("on_fps_button_pressed"),
+                         &FallingSandGrid::on_fps_button_pressed);
     ClassDB::bind_method(D_METHOD("_simulate_chunk", "list_index"),
                          &FallingSandGrid::_simulate_chunk);
 }
 
 void FallingSandGrid::_ready() {
+    // Simulation fixe, indÃ©pendante du nombre d'images affichÃ©es.
+    Engine::get_singleton()->set_physics_ticks_per_second(60);
+
+    // Le rendu dÃ©marre Ã  60 FPS. Le bouton permet ensuite de le dÃ©plafonner.
+    Engine::get_singleton()->set_max_fps(60);
+    DisplayServer::get_singleton()->window_set_vsync_mode(
+            DisplayServer::VSYNC_DISABLED);
+    fps_uncapped = false;
+
     DisplayServer::get_singleton()->window_set_size(
             Vector2i(WORLD_WIDTH * CELL_SIZE, WORLD_HEIGHT * CELL_SIZE + UI_HEIGHT));
 
@@ -332,20 +343,27 @@ uint8_t FallingSandGrid::initial_cell_data(Particle type) const {
 // Boucle principale et chunks
 // ===========================================================================
 
-void FallingSandGrid::_process(double p_delta) {
+void FallingSandGrid::_physics_process(double p_delta) {
     (void)p_delta;
+
+    // Cette partie tourne exactement 60 fois par seconde.
     begin_frame();
     run_simulation();
 
-    // Sous-pas liquides : seuls les liquides rejouent, et le rect de travail
-    // accumule est conserve pour ne pas endormir ce qui n'est pas rejoue.
+    // Les sous-pas liquides sont conservÃ©s : ils sont maintenant eux aussi
+    // exÃ©cutÃ©s Ã  une frÃ©quence stable, indÃ©pendante du FPS de rendu.
     for (int substep = 1; substep < LIQUID_SUBSTEPS; ++substep) {
         begin_frame(false);
         liquids_only = true;
         run_simulation();
         liquids_only = false;
     }
+}
 
+void FallingSandGrid::_process(double p_delta) {
+    (void)p_delta;
+
+    // Le rendu peut Ãªtre plafonnÃ© Ã  60 FPS ou laissÃ© sans limite.
     render_grid();
     update_stats();
     queue_redraw();
@@ -584,32 +602,73 @@ void FallingSandGrid::move_sand(int x, int y) {
 }
 
 FallingSandGrid::FlowCandidate FallingSandGrid::scan_liquid_side(
-        int x, int y, Particle type, int direction, int max_distance) const {
+    int x,
+    int y,
+    Particle type,
+    int direction,
+    int max_distance) const {
+
     FlowCandidate candidate;
     candidate.x = x;
 
+    bool crossed_same_liquid = false;
+
     for (int distance = 1; distance <= max_distance; ++distance) {
         const int target_x = x + direction * distance;
+
         if (target_x < 0 || target_x >= WORLD_WIDTH) {
             break;
         }
 
         const Particle target = cell_type(target_x, y);
+
+        // On autorise la recherche Ã  travers une masse du mÃªme liquide.
+        // Cela simule une propagation de pression horizontale.
+        if (target == type) {
+            crossed_same_liquid = true;
+            continue;
+        }
+
         if (target == EMPTY) {
             candidate.x = target_x;
             candidate.distance = distance;
-        } else if (distance == 1 && can_sink_into(type, target)) {
-            candidate.x = target_x;
-            candidate.distance = 1;
-            break;
-        } else {
-            break;
+
+            if (y + 1 < WORLD_HEIGHT &&
+                can_sink_into(type, cell_type(target_x, y + 1))) {
+                candidate.has_drop = true;
+            }
+
+            // AprÃ¨s avoir traversÃ© le mÃªme liquide, on prend le premier
+            // espace disponible : cela pousse la masse vers son bord.
+            if (candidate.has_drop) {
+                break;
+            }
+
+            if (crossed_same_liquid) {
+                // La pression latÃ©rale ne s'applique qu'environ une fois sur deux.
+                if (rng_bool()) {
+                    break;
+                }
+
+                // Cette frame, la masse ne transmet pas sa pression.
+                candidate.x = x;
+                candidate.distance = 0;
+                candidate.has_drop = false;
+                break;
+            }
+
+            // Dans un couloir dÃ©jÃ  vide, on peut continuer Ã  chercher
+            // une destination plus Ã©loignÃ©e.
+            continue;
         }
 
-        if (y + 1 < WORLD_HEIGHT && can_sink_into(type, cell_type(target_x, y + 1))) {
-            candidate.has_drop = true;
-            break;
+        // Ã‰change direct avec un liquide moins dense.
+        if (distance == 1 && can_sink_into(type, target)) {
+            candidate.x = target_x;
+            candidate.distance = 1;
         }
+
+        break;
     }
 
     return candidate;
@@ -1017,6 +1076,7 @@ void FallingSandGrid::setup_ui() {
                 static_cast<real_t>(start_y + row * (button_height + vertical_gap))));
         button->set_size(Vector2(static_cast<real_t>(button_width),
                                  static_cast<real_t>(button_height)));
+        button->set_mouse_filter(Control::MOUSE_FILTER_STOP);
         button->connect("pressed",
                         Callable(this, "on_particle_button_pressed")
                                 .bind(static_cast<int>(PARTICLE_INFOS[index].type)));
@@ -1024,6 +1084,22 @@ void FallingSandGrid::setup_ui() {
         ui_panel->add_child(button);
         ui_buttons[PARTICLE_INFOS[index].type] = button;
     }
+
+    // Les 11 matÃ©riaux utilisent 11 cases sur une grille de 6 x 2.
+    // Le bouton FPS occupe la douziÃ¨me case libre.
+    fps_button = memnew(Button);
+    fps_button->set_position(Vector2(
+            static_cast<real_t>(start_x + 5 * (button_width + horizontal_gap)),
+            static_cast<real_t>(start_y + button_height + vertical_gap)));
+    fps_button->set_size(Vector2(
+            static_cast<real_t>(button_width),
+            static_cast<real_t>(button_height)));
+    fps_button->set_mouse_filter(Control::MOUSE_FILTER_STOP);
+    fps_button->connect(
+            "pressed",
+            Callable(this, "on_fps_button_pressed"));
+    ui_panel->add_child(fps_button);
+    update_fps_button();
 
     stats_label = memnew(Label);
     stats_label->set_position(Vector2(748.0f, 8.0f));
@@ -1063,6 +1139,11 @@ void FallingSandGrid::update_stats() {
             String("/") + String::num_int64(NUM_CHUNKS);
     text += String("  |  Cellules: ") + String::num_int64(dirty_cell_count);
     text += String("  |  Threads: ") + String(use_threads ? "ON" : "OFF");
+    text += String("  |  Simulation: 60 TPS");
+    text += String("  |  Rendu: ") + String(fps_uncapped ? "UNCAP" : "60 FPS");
+    text += String("  |  Sim: 60 TPS");
+    text += String("  |  Rendu: ") +
+            String(fps_uncapped ? "UNCAP" : "60 FPS");
     text += String("\nMateriau: ") + String(particle_name(selected_particle));
     text += String("  |  Pinceau: ") + String::num_int64(brush_radius);
     text += String("  |  [D] chunks  [T] threads  [C] effacer  [Molette] taille");
@@ -1074,11 +1155,29 @@ void FallingSandGrid::on_particle_button_pressed(int particle_type) {
     update_button_styles();
 }
 
+void FallingSandGrid::on_fps_button_pressed() {
+    fps_uncapped = !fps_uncapped;
+
+    // Une valeur de 0 dÃ©sactive le plafond du rendu.
+    // _physics_process reste nÃ©anmoins fixÃ© Ã  60 ticks par seconde.
+    Engine::get_singleton()->set_max_fps(fps_uncapped ? 0 : 60);
+    update_fps_button();
+}
+
+void FallingSandGrid::update_fps_button() {
+    if (fps_button == nullptr) {
+        return;
+    }
+
+    fps_button->set_text(
+            fps_uncapped ? "FPS : UNCAP" : "FPS : 60");
+}
+
 // ===========================================================================
 // Interaction
 // ===========================================================================
 
-void FallingSandGrid::_input(const Ref<InputEvent> &event) {
+void FallingSandGrid::_unhandled_input(const Ref<InputEvent>& event) {
     Ref<InputEventMouseButton> mouse_button = event;
     if (mouse_button.is_valid()) {
         if (mouse_button->get_button_index() == MOUSE_BUTTON_LEFT) {
@@ -1181,3 +1280,4 @@ void FallingSandGrid::clear_world() {
         chunks[chunk_index].max_y = -1;
     }
 }
+
