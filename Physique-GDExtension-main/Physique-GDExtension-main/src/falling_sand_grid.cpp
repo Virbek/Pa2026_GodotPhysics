@@ -372,7 +372,7 @@ void FallingSandGrid::begin_frame() {
 
         const int chunk_x = chunk_index % CHUNKS_X;
         const int chunk_y = chunk_index / CHUNKS_X;
-        pass_lists[(chunk_x & 1) | ((chunk_y & 1) << 1)].push_back(chunk_index);
+        pass_lists[(CHUNKS_Y - 1 - chunk_y) * 2 + (chunk_x & 1)].push_back(chunk_index);
 
         ++active_chunk_count;
         dirty_cell_count += static_cast<int64_t>(chunk.max_x - chunk.min_x + 1) *
@@ -392,7 +392,7 @@ void FallingSandGrid::begin_frame() {
 void FallingSandGrid::run_simulation() {
     WorkerThreadPool *thread_pool = WorkerThreadPool::get_singleton();
 
-    for (int pass = 0; pass < 4; ++pass) {
+    for (int pass = 0; pass < NUM_PASSES; ++pass) {
         if (pass_lists[pass].empty()) {
             continue;
         }
