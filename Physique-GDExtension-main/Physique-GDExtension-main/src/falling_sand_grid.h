@@ -6,7 +6,8 @@
 // Points importants :
 //  * grille et cell_data sont deux tableaux 1D contigus ;
 //  * le monde est decoupe en chunks avec dirty rects ;
-//  * simulation en damier 2x2 sur WorkerThreadPool ;
+//  * les rangees de chunks sont simulees du bas vers le haut, chacune en
+//    damier pair/impair sur X via le WorkerThreadPool ;
 //  * UPDATED_BIT interdit de simuler deux fois une particule dans une frame ;
 //  * la texture R8 contient directement le type de chaque cellule ;
 //  * cell_data stocke la duree de vie du feu/des gaz ou le temps de
@@ -61,6 +62,13 @@ public:
     static const int CHUNKS_Y = WORLD_HEIGHT / CHUNK_SIZE;
     static const int NUM_CHUNKS = CHUNKS_X * CHUNKS_Y;
 
+    // La gravite impose de simuler les cellules du bas vers le haut : une
+    // particule ne peut tomber que si celle du dessous a deja bouge. L'ordre
+    // des passes respecte donc les rangees de chunks de bas en haut, et chaque
+    // rangee est coupee en deux passes (X pair puis X impair) pour que deux
+    // chunks simules en parallele restent separes de CHUNK_SIZE cellules.
+    static const int NUM_PASSES = CHUNKS_Y * 2;
+
     // L'eau compare les deux directions et peut parcourir plusieurs cellules
     // pour trouver un bord ou un trou. Cette valeur est aussi le mouvement
     // horizontal maximal de toute particule pendant une frame.
@@ -106,7 +114,7 @@ private:
     std::vector<uint8_t> grid;
     std::vector<uint8_t> cell_data;
     std::unique_ptr<Chunk[]> chunks;
-    std::vector<int> pass_lists[4];
+    std::vector<int> pass_lists[NUM_PASSES];
     int current_pass = 0;
 
     // Stats / debug.
