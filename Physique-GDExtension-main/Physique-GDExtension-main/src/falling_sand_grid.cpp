@@ -336,12 +336,22 @@ void FallingSandGrid::_process(double p_delta) {
     (void)p_delta;
     begin_frame();
     run_simulation();
+
+    // Sous-pas liquides : seuls les liquides rejouent, et le rect de travail
+    // accumule est conserve pour ne pas endormir ce qui n'est pas rejoue.
+    for (int substep = 1; substep < LIQUID_SUBSTEPS; ++substep) {
+        begin_frame(false);
+        liquids_only = true;
+        run_simulation();
+        liquids_only = false;
+    }
+
     render_grid();
     update_stats();
     queue_redraw();
 }
 
-void FallingSandGrid::begin_frame() {
+void FallingSandGrid::begin_frame(bool p_reset_working) {
     active_chunk_count = 0;
     dirty_cell_count = 0;
     for (std::vector<int> &list : pass_lists) {
@@ -357,7 +367,9 @@ void FallingSandGrid::begin_frame() {
         chunk.min_y = chunk.w_min_y.load(std::memory_order_relaxed);
         chunk.max_x = chunk.w_max_x.load(std::memory_order_relaxed);
         chunk.max_y = chunk.w_max_y.load(std::memory_order_relaxed);
-        chunk.reset_working();
+        if (p_reset_working) {
+            chunk.reset_working();
+        }
 
         if (!chunk.active()) {
             continue;
@@ -434,6 +446,9 @@ void FallingSandGrid::simulate_chunk_cells(const Chunk &chunk) {
             }
 
             const Particle type = static_cast<Particle>(encoded & TYPE_MASK);
+            if (liquids_only && !is_liquid(type)) {
+                continue;
+            }
             switch (type) {
                 case SAND:
                     move_sand(x, y);
@@ -601,14 +616,18 @@ FallingSandGrid::FlowCandidate FallingSandGrid::scan_liquid_side(
 }
 
 void FallingSandGrid::move_liquid(int x, int y, Particle type) {
-    if (type == WATER && process_water_reactions(x, y)) {
-        return;
-    }
-    if (type == LAVA && process_lava_reactions(x, y)) {
-        return;
-    }
-    if (type == ACID && process_acid_reactions(x, y)) {
-        return;
+    // Les reactions ne tournent que sur la passe principale : les rejouer a
+    // chaque sous-pas multiplierait leurs probabilites par LIQUID_SUBSTEPS.
+    if (!liquids_only) {
+        if (type == WATER && process_water_reactions(x, y)) {
+            return;
+        }
+        if (type == LAVA && process_lava_reactions(x, y)) {
+            return;
+        }
+        if (type == ACID && process_acid_reactions(x, y)) {
+            return;
+        }
     }
 
     if (y + 1 < WORLD_HEIGHT && can_sink_into(type, cell_type(x, y + 1))) {

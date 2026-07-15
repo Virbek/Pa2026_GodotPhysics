@@ -69,6 +69,14 @@ public:
     // chunks simules en parallele restent separes de CHUNK_SIZE cellules.
     static const int NUM_PASSES = CHUNKS_Y * 2;
 
+    // Un liquide ne peut avancer que la ou il voit du vide sur sa propre ligne :
+    // au milieu d'une large surface plane il est immobile, et une flaque ne se
+    // nivelle qu'en s'erodant par ses bords, ~2 cellules par frame. On rejoue
+    // donc les liquides plusieurs fois par frame pour accelerer d'autant. Les
+    // solides et les gaz ne sont pas rejoues, sinon toute la simulation serait
+    // simplement en avance rapide. Cout CPU proportionnel quand l'eau bouge.
+    static const int LIQUID_SUBSTEPS = 3;
+
     // L'eau compare les deux directions et peut parcourir plusieurs cellules
     // pour trouver un bord ou un trou. Cette valeur est aussi le mouvement
     // horizontal maximal de toute particule pendant une frame.
@@ -116,6 +124,7 @@ private:
     std::unique_ptr<Chunk[]> chunks;
     std::vector<int> pass_lists[NUM_PASSES];
     int current_pass = 0;
+    bool liquids_only = false;
 
     // Stats / debug.
     int active_chunk_count = 0;
@@ -169,7 +178,10 @@ private:
     void move_cell(int x1, int y1, int x2, int y2);
     void keep_liquid_awake(int x, int y);
 
-    void begin_frame();
+    // reset_working=false : conserve le rect de travail accumule. Indispensable
+    // pour les sous-pas liquides, sinon les particules non rejouees (sable,
+    // gaz) perdent leur marquage, leur chunk s'endort et elles se figent.
+    void begin_frame(bool reset_working = true);
     void run_simulation();
     void simulate_chunk_cells(const Chunk &chunk);
 
