@@ -1,30 +1,5 @@
 extends Node2D
 
-# ============================================================================
-# FallingSandGrid — portage GDScript de la GDExtension C++ (falling_sand_grid.cpp).
-#
-# Objectif : reproduire EXACTEMENT le même algorithme pour comparer les
-# performances GDScript vs C++ avec benchmark_logger.gd.
-#
-#  * grid et cell_data sont deux PackedByteArray 1D contigus (comme en C++) ;
-#  * le monde est découpé en chunks avec dirty rects ;
-#  * les rangées de chunks sont simulées du bas vers le haut, en damier
-#    pair/impair sur X (ordre identique au C++) ;
-#  * UPDATED_BIT interdit de simuler deux fois une particule dans une frame ;
-#  * la texture R8 contient directement le type de chaque cellule
-#    (le PackedByteArray grid est envoyé tel quel à Image.set_data) ;
-#  * cell_data stocke la durée de vie du feu/des gaz ou le temps de
-#    stabilisation restant d'un liquide.
-#
-# Différence assumée avec le C++ : PAS de multithreading. GDScript n'a ni
-# atomiques ni écriture concurrente sûre dans un PackedByteArray partagé,
-# donc les passes sont exécutées séquentiellement (équivalent de "Threads:
-# OFF" côté C++). La touche T n'existe donc pas ici.
-#
-# Pour benchmark_logger.gd, ce script expose :
-#   get_last_simulation_ms(), get_last_render_ms(), get_active_particle_count()
-# ============================================================================
-
 enum Particle {
 	EMPTY = 0,
 	SAND = 1,
@@ -45,19 +20,13 @@ const CELL_SIZE: int = 2
 const UI_HEIGHT: int = 100
 
 const CHUNK_SIZE: int = 64
-const CHUNK_SHIFT: int = 6 # 2^6 = 64, évite les divisions dans mark_dirty()
-const CHUNKS_X: int = 12   # WORLD_WIDTH / CHUNK_SIZE
-const CHUNKS_Y: int = 6    # WORLD_HEIGHT / CHUNK_SIZE
+const CHUNK_SHIFT: int = 6
+const CHUNKS_X: int = 12
+const CHUNKS_Y: int = 6
 const NUM_CHUNKS: int = CHUNKS_X * CHUNKS_Y
 
-# La gravité impose de simuler les cellules du bas vers le haut. L'ordre des
-# passes respecte les rangées de chunks de bas en haut, chaque rangée coupée
-# en deux passes (X pair puis X impair) — conservé à l'identique du C++ pour
-# que l'ordre de mise à jour soit le même, même sans threads.
 const NUM_PASSES: int = CHUNKS_Y * 2
 
-# Les liquides sont rejoués plusieurs fois par frame pour accélérer le
-# nivellement des flaques. Solides et gaz ne sont pas rejoués.
 const LIQUID_SUBSTEPS: int = 3
 
 const WATER_DISPERSION: int = 10
@@ -75,12 +44,8 @@ const LIQUID_SETTLE_FRAMES: int = 24
 const INT32_MAX: int = 2147483647
 const INT32_MIN: int = -2147483648
 
-# Shader optionnel assignable dans l'inspecteur. Si vide, le shader embarqué
-# ci-dessous est utilisé (copie exacte de FALLING_SAND_SHADER du C++).
 @export var visual_shader: Shader
 
-# Sans ce shader, la texture R8 s'affiche brute : les IDs 1-10 donnent du
-# quasi-noir et UPDATED_BIT (0x80) du rouge moyen -> couleurs fausses.
 const FALLING_SAND_SHADER: String = """
 shader_type canvas_item;
 render_mode unshaded;
@@ -190,13 +155,9 @@ const STEAM_OFFSETS: Array = [
 	Vector2i(0, -2), Vector2i(-2, -1), Vector2i(2, -1),
 ]
 
-# --- Données de simulation ---------------------------------------------------
 var grid := PackedByteArray()
 var cell_data := PackedByteArray()
 
-# Chunks en "struct of arrays" (bien plus rapide en GDScript que des objets).
-# w_* = rect de travail accumulé pendant la frame ; min/max = rect figé
-# au début de la frame, utilisé pour itérer.
 var chunk_w_min_x := PackedInt32Array()
 var chunk_w_min_y := PackedInt32Array()
 var chunk_w_max_x := PackedInt32Array()
@@ -209,7 +170,6 @@ var chunk_max_y := PackedInt32Array()
 var pass_lists: Array = []
 var liquids_only := false
 
-# --- Stats / debug -----------------------------------------------------------
 var active_chunk_count: int = 0
 var dirty_cell_count: int = 0
 var debug_overlay := false
@@ -217,35 +177,25 @@ var frame_counter: int = 0
 var debug_chunk_rects: Array[Rect2i] = []
 var debug_dirty_rects: Array[Rect2i] = []
 
-# Pour benchmark_logger.gd
 var last_simulation_ms := 0.0
 var last_render_ms := 0.0
 
-# --- Pinceau -----------------------------------------------------------------
 var selected_particle: int = Particle.SAND
 var brush_radius: int = 6
 var painting := false
 var last_paint_cell := Vector2i.ZERO
 
-# --- Rendu -------------------------------------------------------------------
 var image: Image
 var texture: ImageTexture
 var sprite: Sprite2D
 
-# --- UI ----------------------------------------------------------------------
 var ui_panel: Panel
 var stats_label: Label
 var fps_button: Button
 var ui_buttons := {}
 
-# Le rendu peut être plafonné à 60 FPS ou laissé sans limite.
-# La simulation reste dans tous les cas à 60 ticks par seconde.
 var fps_uncapped := false
 
-
-# ===========================================================================
-# Cycle de vie
-# ===========================================================================
 
 func _ready() -> void:
 	assert(WORLD_WIDTH % CHUNK_SIZE == 0, "WORLD_WIDTH doit etre un multiple de CHUNK_SIZE")
@@ -254,10 +204,8 @@ func _ready() -> void:
 	assert((1 << CHUNK_SHIFT) == CHUNK_SIZE)
 	assert(MAX_MOVE_DISTANCE * 2 + 2 < CHUNK_SIZE, "MAX_MOVE_DISTANCE trop grand")
 
-	# Simulation fixe, indépendante du nombre d'images affichées.
 	Engine.physics_ticks_per_second = 60
 
-	# Le rendu démarre à 60 FPS. Le bouton permet ensuite de le déplafonner.
 	Engine.max_fps = 60
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 	fps_uncapped = false
@@ -266,7 +214,7 @@ func _ready() -> void:
 			Vector2i(WORLD_WIDTH * CELL_SIZE, WORLD_HEIGHT * CELL_SIZE + UI_HEIGHT))
 
 	var cell_count := WORLD_WIDTH * WORLD_HEIGHT
-	grid.resize(cell_count)      # rempli de zéros = EMPTY
+	grid.resize(cell_count)
 	cell_data.resize(cell_count)
 
 	chunk_w_min_x.resize(NUM_CHUNKS)
@@ -288,8 +236,6 @@ func _ready() -> void:
 	for pass_index in NUM_PASSES:
 		pass_lists[pass_index] = []
 
-	# La texture R8 reçoit directement le contenu de grid (le shader fait % 128
-	# pour ignorer UPDATED_BIT, exactement comme côté C++).
 	image = Image.create_from_data(WORLD_WIDTH, WORLD_HEIGHT, false, Image.FORMAT_R8, grid)
 	texture = ImageTexture.create_from_image(image)
 
@@ -307,8 +253,6 @@ func _ready() -> void:
 
 
 func setup_material() -> void:
-	# Même approche que le C++ : le shader est embarqué dans le code, donc
-	# aucun risque de chemin de fichier invalide -> plus jamais de rendu R8 brut.
 	var shader := visual_shader
 	if shader == null:
 		shader = Shader.new()
@@ -318,10 +262,6 @@ func setup_material() -> void:
 	material.shader = shader
 	sprite.material = material
 
-
-# ===========================================================================
-# Propriétés des matériaux
-# ===========================================================================
 
 static func is_solid(type: int) -> bool:
 	return type == Particle.ROCK or type == Particle.WOOD
@@ -388,10 +328,6 @@ func initial_cell_data(type: int) -> int:
 		_: return 0
 
 
-# ===========================================================================
-# RNG (équivalent des helpers xorshift du C++)
-# ===========================================================================
-
 func _rng_bool() -> bool:
 	return (randi() & 1) != 0
 
@@ -404,20 +340,13 @@ func _rng_u8(minimum: int, maximum: int) -> int:
 	return minimum + (randi() % (maximum - minimum + 1))
 
 
-# ===========================================================================
-# Boucle principale et chunks
-# ===========================================================================
-
+# Met à jour la simulation à fréquence fixe et ajoute des sous-pas pour les liquides
 func _physics_process(_delta: float) -> void:
-	# Cette partie tourne exactement 60 fois par seconde.
 	var start_usec := Time.get_ticks_usec()
 
 	begin_frame()
 	run_simulation()
 
-	# Sous-pas liquides : reset_working=false conserve le rect de travail
-	# accumulé, sinon les particules non rejouées (sable, gaz) perdraient leur
-	# marquage, leur chunk s'endormirait et elles se figeraient.
 	for substep in range(1, LIQUID_SUBSTEPS):
 		begin_frame(false)
 		liquids_only = true
@@ -443,6 +372,7 @@ func reset_chunk_working(chunk_index: int) -> void:
 	chunk_w_max_y[chunk_index] = INT32_MIN
 
 
+# Prépare les chunks actifs et réinitialise leur état pour la nouvelle frame
 func begin_frame(reset_working: bool = true) -> void:
 	active_chunk_count = 0
 	dirty_cell_count = 0
@@ -466,7 +396,6 @@ func begin_frame(reset_working: bool = true) -> void:
 		if cmax_x < cmin_x or cmax_y < cmin_y:
 			continue
 
-		# Efface UPDATED_BIT dans le rect actif.
 		for y in range(cmin_y, cmax_y + 1):
 			var row_base := y * WORLD_WIDTH
 			for x in range(cmin_x, cmax_x + 1):
@@ -489,15 +418,13 @@ func begin_frame(reset_working: bool = true) -> void:
 
 
 func run_simulation() -> void:
-	# Contrairement au C++, pas de WorkerThreadPool : GDScript ne permet pas
-	# d'écrire de façon sûre dans un PackedByteArray partagé sans mutex (qui
-	# coûterait plus cher que le gain). Même ordre de passes, mais séquentiel.
 	for pass_index in NUM_PASSES:
 		var list: Array = pass_lists[pass_index]
 		for chunk_index in list:
 			simulate_chunk_cells(chunk_index)
 
 
+# Parcourt les cellules de bas en haut pour respecter la gravité
 func simulate_chunk_cells(chunk_index: int) -> void:
 	var cmin_x := chunk_min_x[chunk_index]
 	var cmin_y := chunk_min_y[chunk_index]
@@ -514,7 +441,6 @@ func simulate_chunk_cells(chunk_index: int) -> void:
 
 		while x != x_end:
 			var encoded := grid[row_base + x]
-			# encoded == 0 -> EMPTY, on saute immédiatement (cas le plus fréquent).
 			if encoded != 0 and (encoded & UPDATED_BIT) == 0:
 				var type := encoded & TYPE_MASK
 				if not liquids_only or is_liquid(type):
@@ -530,10 +456,6 @@ func simulate_chunk_cells(chunk_index: int) -> void:
 			x += step
 		y -= 1
 
-
-# ===========================================================================
-# Écriture, déplacement et réveil
-# ===========================================================================
 
 static func in_world(x: int, y: int) -> bool:
 	return x >= 0 and x < WORLD_WIDTH and y >= 0 and y < WORLD_HEIGHT
@@ -556,6 +478,7 @@ func set_cell(x: int, y: int, type: int, data: int, updated: bool) -> void:
 	mark_dirty(x, y)
 
 
+# Déplace ou échange deux particules puis réveille les zones concernées
 func move_cell(x1: int, y1: int, x2: int, y2: int) -> void:
 	var source_index := y1 * WORLD_WIDTH + x1
 	var target_index := y2 * WORLD_WIDTH + x2
@@ -620,10 +543,6 @@ func mark_dirty(x: int, y: int, radius_x: int = 1, radius_y: int = 1) -> void:
 				chunk_w_max_y[chunk_index] = cell_y1
 
 
-# ===========================================================================
-# Sable et liquides
-# ===========================================================================
-
 func move_sand(x: int, y: int) -> void:
 	if y + 1 >= WORLD_HEIGHT:
 		return
@@ -646,8 +565,7 @@ func move_sand(x: int, y: int) -> void:
 			return
 
 
-# Retourne un Vector3i(x_cible, distance, has_drop) — un Vector3i n'alloue
-# rien sur le tas, contrairement à un Dictionary ou un Array.
+# Recherche une position horizontale disponible pour étaler un liquide
 func scan_liquid_side(x: int, y: int, type: int, direction: int, max_distance: int) -> Vector3i:
 	var candidate_x := x
 	var candidate_distance := 0
@@ -664,8 +582,6 @@ func scan_liquid_side(x: int, y: int, type: int, direction: int, max_distance: i
 
 		var target := cell_type(target_x, y)
 
-		# On autorise la recherche à travers une masse du même liquide.
-		# Cela simule une propagation de pression horizontale.
 		if target == type:
 			crossed_same_liquid = true
 			distance += 1
@@ -679,28 +595,21 @@ func scan_liquid_side(x: int, y: int, type: int, direction: int, max_distance: i
 			if y + 1 < WORLD_HEIGHT and can_sink_into(type, cell_type(target_x, y + 1)):
 				candidate_drop = 1
 
-			# Après avoir traversé le même liquide, on prend le premier
-			# espace disponible : cela pousse la masse vers son bord.
 			if candidate_drop == 1:
 				break
 
 			if crossed_same_liquid:
-				# La pression latérale ne s'applique qu'environ une fois sur deux.
 				if _rng_bool():
 					break
 
-				# Cette frame, la masse ne transmet pas sa pression.
 				candidate_x = x
 				candidate_distance = 0
 				candidate_drop = 0
 				break
 
-			# Dans un couloir déjà vide, on peut continuer à chercher
-			# une destination plus éloignée.
 			distance += 1
 			continue
 
-		# Échange direct avec un liquide moins dense.
 		if distance == 1 and can_sink_into(type, target):
 			candidate_x = target_x
 			candidate_distance = 1
@@ -710,9 +619,8 @@ func scan_liquid_side(x: int, y: int, type: int, direction: int, max_distance: i
 	return Vector3i(candidate_x, candidate_distance, candidate_drop)
 
 
+# Un liquide tombe, glisse en diagonale puis s'étale horizontalement
 func move_liquid(x: int, y: int, type: int) -> void:
-	# Les réactions ne tournent que sur la passe principale : les rejouer à
-	# chaque sous-pas multiplierait leurs probabilités par LIQUID_SUBSTEPS.
 	if not liquids_only:
 		if type == Particle.WATER and process_water_reactions(x, y):
 			return
@@ -743,7 +651,6 @@ func move_liquid(x: int, y: int, type: int) -> void:
 	var left := scan_liquid_side(x, y, type, -1, dispersion)
 	var right := scan_liquid_side(x, y, type, 1, dispersion)
 
-	# .x = position cible, .y = distance, .z = has_drop
 	var chosen := Vector3i(x, 0, 0)
 	var has_chosen := false
 	if left.z != right.z:
@@ -766,16 +673,10 @@ func move_liquid(x: int, y: int, type: int) -> void:
 		move_cell(x, y, chosen.x, y)
 		return
 
-	# Une cellule liquide immobile continue d'être testée quelques frames.
-	# Cela évite qu'une flaque se fige prématurément sur les frontières des
-	# dirty rects, tout en permettant au chunk de s'endormir ensuite.
 	keep_liquid_awake(x, y)
 
 
-# ===========================================================================
-# Gaz, vapeur et feu
-# ===========================================================================
-
+# Les gaz montent en priorité puis se dispersent sur les côtés
 func try_move_gas(x: int, y: int, type: int, horizontal_dispersion: int) -> bool:
 	if y > 0 and can_gas_rise_into(type, cell_type(x, y - 1)):
 		move_cell(x, y, x, y - 1)
@@ -836,7 +737,6 @@ func move_smoke_or_steam(x: int, y: int, type: int) -> void:
 
 	cell_data[index] = life - 1
 	if not try_move_gas(x, y, type, GAS_DISPERSION):
-		# Un gaz bloqué doit rester actif pour vieillir, puis mourir.
 		mark_dirty(x, y)
 
 
@@ -857,10 +757,6 @@ func move_fire(x: int, y: int) -> void:
 	if not try_move_gas(x, y, Particle.FIRE, 2):
 		mark_dirty(x, y)
 
-
-# ===========================================================================
-# Réactions
-# ===========================================================================
 
 func process_water_reactions(x: int, y: int) -> bool:
 	var extinguished_fire := false
@@ -884,8 +780,8 @@ func process_water_reactions(x: int, y: int) -> bool:
 	return extinguished_fire
 
 
+# Gère l'extinction du feu et la propagation aux matériaux inflammables
 func process_fire_reactions(x: int, y: int) -> bool:
-	# L'eau éteint immédiatement le feu : la cellule de feu devient vapeur.
 	for offset_y in range(-1, 2):
 		for offset_x in range(-1, 2):
 			if offset_x == 0 and offset_y == 0:
@@ -897,7 +793,6 @@ func process_fire_reactions(x: int, y: int) -> bool:
 				set_cell(x, y, Particle.STEAM, initial_cell_data(Particle.STEAM), true)
 				return true
 
-	# Le feu enflamme le bois lentement et l'huile beaucoup plus vite.
 	for offset_y in range(-1, 2):
 		for offset_x in range(-1, 2):
 			if offset_x == 0 and offset_y == 0:
@@ -931,7 +826,6 @@ func process_lava_reactions(x: int, y: int) -> bool:
 
 			var neighbor := cell_type(neighbor_x, neighbor_y)
 			if neighbor == Particle.WATER:
-				# La lave minéralise l'eau au contact et libère de la vapeur.
 				set_cell(neighbor_x, neighbor_y, Particle.ROCK, 0, true)
 				spawn_steam_near(neighbor_x, neighbor_y)
 				reacted = true
@@ -987,12 +881,8 @@ func spawn_steam_near(x: int, y: int) -> void:
 			return
 
 
-# ===========================================================================
-# Rendu et interface
-# ===========================================================================
-
+# Copie la grille de simulation dans la texture affichée.
 func render_grid() -> void:
-	# grid EST le buffer de pixels : un octet par cellule, format R8.
 	image.set_data(WORLD_WIDTH, WORLD_HEIGHT, false, Image.FORMAT_R8, grid)
 	texture.update(image)
 
@@ -1065,8 +955,6 @@ func setup_ui() -> void:
 		ui_panel.add_child(button)
 		ui_buttons[PARTICLE_INFOS[index][0]] = button
 
-	# Les 11 matériaux utilisent 11 cases sur une grille de 6 x 2.
-	# Le bouton FPS occupe la douzième case libre.
 	fps_button = Button.new()
 	fps_button.position = Vector2(
 			start_x + 5 * (button_width + horizontal_gap),
@@ -1125,8 +1013,6 @@ func on_particle_button_pressed(particle_type: int) -> void:
 func on_fps_button_pressed() -> void:
 	fps_uncapped = not fps_uncapped
 
-	# Une valeur de 0 désactive le plafond du rendu.
-	# _physics_process reste néanmoins fixé à 60 ticks par seconde.
 	Engine.max_fps = 0 if fps_uncapped else 60
 	update_fps_button()
 
@@ -1137,10 +1023,7 @@ func update_fps_button() -> void:
 	fps_button.text = "FPS : UNCAP" if fps_uncapped else "FPS : 60"
 
 
-# ===========================================================================
-# Interaction
-# ===========================================================================
-
+# Gère le dessin des particules, la taille du pinceau et les raccourcis.
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_LEFT:
@@ -1224,10 +1107,6 @@ func clear_world() -> void:
 		chunk_max_y[chunk_index] = -1
 
 
-# ===========================================================================
-# API pour benchmark_logger.gd
-# ===========================================================================
-
 func get_last_simulation_ms() -> float:
 	return last_simulation_ms
 
@@ -1236,7 +1115,5 @@ func get_last_render_ms() -> float:
 	return last_render_ms
 
 
-# Même métrique que la stat "Cellules" du C++ : nombre de cellules couvertes
-# par les dirty rects actifs cette frame (proxy du travail réellement simulé).
 func get_active_particle_count() -> int:
 	return dirty_cell_count

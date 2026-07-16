@@ -1,19 +1,5 @@
 ﻿#pragma once
 
-// ============================================================================
-// FallingSandGrid â€” automate cellulaire 2D inspire de Noita.
-//
-// Points importants :
-//  * grille et cell_data sont deux tableaux 1D contigus ;
-//  * le monde est decoupe en chunks avec dirty rects ;
-//  * les rangees de chunks sont simulees du bas vers le haut, chacune en
-//    damier pair/impair sur X via le WorkerThreadPool ;
-//  * UPDATED_BIT interdit de simuler deux fois une particule dans une frame ;
-//  * la texture R8 contient directement le type de chaque cellule ;
-//  * cell_data stocke la duree de vie du feu/des gaz ou le temps de
-//    stabilisation restant d'un liquide.
-// ============================================================================
-
 #include <atomic>
 #include <climits>
 #include <cstdint>
@@ -61,25 +47,9 @@ public:
     static const int CHUNKS_X = WORLD_WIDTH / CHUNK_SIZE;
     static const int CHUNKS_Y = WORLD_HEIGHT / CHUNK_SIZE;
     static const int NUM_CHUNKS = CHUNKS_X * CHUNKS_Y;
-
-    // La gravite impose de simuler les cellules du bas vers le haut : une
-    // particule ne peut tomber que si celle du dessous a deja bouge. L'ordre
-    // des passes respecte donc les rangees de chunks de bas en haut, et chaque
-    // rangee est coupee en deux passes (X pair puis X impair) pour que deux
-    // chunks simules en parallele restent separes de CHUNK_SIZE cellules.
     static const int NUM_PASSES = CHUNKS_Y * 2;
-
-    // Un liquide ne peut avancer que la ou il voit du vide sur sa propre ligne :
-    // au milieu d'une large surface plane il est immobile, et une flaque ne se
-    // nivelle qu'en s'erodant par ses bords, ~2 cellules par frame. On rejoue
-    // donc les liquides plusieurs fois par frame pour accelerer d'autant. Les
-    // solides et les gaz ne sont pas rejoues, sinon toute la simulation serait
-    // simplement en avance rapide. Cout CPU proportionnel quand l'eau bouge.
     static const int LIQUID_SUBSTEPS = 3;
 
-    // L'eau compare les deux directions et peut parcourir plusieurs cellules
-    // pour trouver un bord ou un trou. Cette valeur est aussi le mouvement
-    // horizontal maximal de toute particule pendant une frame.
     static const int WATER_DISPERSION = 10;
     static const int OIL_DISPERSION = 8;
     static const int ACID_DISPERSION = 4;
@@ -118,7 +88,7 @@ private:
         bool has_drop = false;
     };
 
-    // Donnees de simulation.
+    // Donnees de simulation
     std::vector<uint8_t> grid;
     std::vector<uint8_t> cell_data;
     std::unique_ptr<Chunk[]> chunks;
@@ -126,7 +96,7 @@ private:
     int current_pass = 0;
     bool liquids_only = false;
 
-    // Stats / debug.
+    // Stats / debug
     int active_chunk_count = 0;
     int64_t dirty_cell_count = 0;
     bool use_threads = true;
@@ -135,26 +105,24 @@ private:
     std::vector<Rect2i> debug_chunk_rects;
     std::vector<Rect2i> debug_dirty_rects;
 
-    // Pinceau.
+    // Pinceau
     Particle selected_particle = SAND;
     int brush_radius = 6;
     bool painting = false;
     Vector2i last_paint_cell;
 
-    // Rendu.
+    // Rendu
     PackedByteArray pixel_bytes;
     Ref<Image> image;
     Ref<ImageTexture> texture;
     Sprite2D *sprite = nullptr;
 
-    // UI.
+    // UI
     Panel *ui_panel = nullptr;
     Label *stats_label = nullptr;
     Button *fps_button = nullptr;
     std::map<Particle, Button *> ui_buttons;
 
-    // Le rendu peut Ãªtre plafonnÃ© Ã  60 FPS ou laissÃ© sans limite.
-    // La simulation reste dans tous les cas Ã  60 ticks par seconde.
     bool fps_uncapped = false;
 
     static inline int get_index(int x, int y) { return y * WORLD_WIDTH + x; }
@@ -183,9 +151,6 @@ private:
     void move_cell(int x1, int y1, int x2, int y2);
     void keep_liquid_awake(int x, int y);
 
-    // reset_working=false : conserve le rect de travail accumule. Indispensable
-    // pour les sous-pas liquides, sinon les particules non rejouees (sable,
-    // gaz) perdent leur marquage, leur chunk s'endort et elles se figent.
     void begin_frame(bool reset_working = true);
     void run_simulation();
     void simulate_chunk_cells(const Chunk &chunk);

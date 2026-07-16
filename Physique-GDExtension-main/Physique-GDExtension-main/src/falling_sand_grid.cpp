@@ -18,61 +18,67 @@
 
 using namespace godot;
 
-static_assert(FallingSandGrid::WORLD_WIDTH % FallingSandGrid::CHUNK_SIZE == 0,
-              "WORLD_WIDTH doit etre un multiple de CHUNK_SIZE");
-static_assert(FallingSandGrid::WORLD_HEIGHT % FallingSandGrid::CHUNK_SIZE == 0,
-              "WORLD_HEIGHT doit etre un multiple de CHUNK_SIZE");
+static_assert(FallingSandGrid::WORLD_WIDTH% FallingSandGrid::CHUNK_SIZE == 0,
+    "WORLD_WIDTH doit etre un multiple de CHUNK_SIZE");
+static_assert(FallingSandGrid::WORLD_HEIGHT% FallingSandGrid::CHUNK_SIZE == 0,
+    "WORLD_HEIGHT doit etre un multiple de CHUNK_SIZE");
 static_assert(FallingSandGrid::MAX_MOVE_DISTANCE * 2 + 2 < FallingSandGrid::CHUNK_SIZE,
-              "MAX_MOVE_DISTANCE trop grand pour la securite du damier multithread");
+    "MAX_MOVE_DISTANCE trop grand pour la securite du damier multithread");
 
 namespace {
 
-constexpr uint8_t LIQUID_SETTLE_FRAMES = 24;
+    constexpr uint8_t LIQUID_SETTLE_FRAMES = 24;
 
-inline uint32_t rng_next() {
-    thread_local uint32_t state = 0;
-    if (state == 0) {
-        const uint64_t pointer_value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&state));
-        state = static_cast<uint32_t>(pointer_value ^ (pointer_value >> 32)) * 2654435761u;
-        state ^= 0x9E3779B9u;
+    // Génération aléatoire
+    inline uint32_t rng_next() {
+        thread_local uint32_t state = 0;
         if (state == 0) {
-            state = 1;
+            const uint64_t pointer_value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&state));
+            state = static_cast<uint32_t>(pointer_value ^ (pointer_value >> 32)) * 2654435761u;
+            state ^= 0x9E3779B9u;
+            if (state == 0) {
+                state = 1;
+            }
+        }
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    }
+
+    // Bool aléatoire
+    inline bool rng_bool() {
+        return (rng_next() & 1u) != 0u;
+    }
+
+    // Proba aléatoire
+    inline bool rng_chance(uint32_t numerator, uint32_t denominator) {
+        return denominator != 0u && (rng_next() % denominator) < numerator;
+    }
+
+    // Int aléatoire
+    inline uint8_t rng_u8(uint8_t minimum, uint8_t maximum) {
+        const uint32_t range = static_cast<uint32_t>(maximum - minimum) + 1u;
+        return static_cast<uint8_t>(minimum + (rng_next() % range));
+    }
+
+    // Min atomique
+    inline void atomic_fetch_min(std::atomic<int>& value, int candidate) {
+        int current = value.load(std::memory_order_relaxed);
+        while (candidate < current &&
+            !value.compare_exchange_weak(current, candidate, std::memory_order_relaxed)) {
         }
     }
-    state ^= state << 13;
-    state ^= state >> 17;
-    state ^= state << 5;
-    return state;
-}
 
-inline bool rng_bool() {
-    return (rng_next() & 1u) != 0u;
-}
-
-inline bool rng_chance(uint32_t numerator, uint32_t denominator) {
-    return denominator != 0u && (rng_next() % denominator) < numerator;
-}
-
-inline uint8_t rng_u8(uint8_t minimum, uint8_t maximum) {
-    const uint32_t range = static_cast<uint32_t>(maximum - minimum) + 1u;
-    return static_cast<uint8_t>(minimum + (rng_next() % range));
-}
-
-inline void atomic_fetch_min(std::atomic<int> &value, int candidate) {
-    int current = value.load(std::memory_order_relaxed);
-    while (candidate < current &&
-           !value.compare_exchange_weak(current, candidate, std::memory_order_relaxed)) {
+    // Max atomique
+    inline void atomic_fetch_max(std::atomic<int>& value, int candidate) {
+        int current = value.load(std::memory_order_relaxed);
+        while (candidate > current &&
+            !value.compare_exchange_weak(current, candidate, std::memory_order_relaxed)) {
+        }
     }
-}
 
-inline void atomic_fetch_max(std::atomic<int> &value, int candidate) {
-    int current = value.load(std::memory_order_relaxed);
-    while (candidate > current &&
-           !value.compare_exchange_weak(current, candidate, std::memory_order_relaxed)) {
-    }
-}
-
-const char *FALLING_SAND_SHADER = R"SHADER(
+    const char* FALLING_SAND_SHADER = R"SHADER(
 shader_type canvas_item;
 render_mode unshaded;
 
@@ -86,6 +92,7 @@ int decode_material(float encoded) {
     return int(encoded * 255.0 + 0.5) % 128;
 }
 
+// Couleur
 void fragment() {
     ivec2 texture_size = textureSize(TEXTURE, 0);
     vec2 texel = 1.0 / vec2(texture_size);
@@ -155,54 +162,53 @@ void fragment() {
 }
 )SHADER";
 
-Ref<StyleBoxFlat> make_button_style(const Color &base, bool selected, float lighten) {
-    Ref<StyleBoxFlat> style;
-    style.instantiate();
-    style->set_bg_color(selected ? base.lightened(0.28f + lighten) : base.lightened(lighten));
-    if (selected) {
-        style->set_border_width_all(3);
-        style->set_border_color(Color(1.0f, 1.0f, 1.0f));
-    }
-    return style;
-}
-
-struct ParticleInfo {
-    Particle type;
-    const char *name;
-    Color color;
-};
-
-const ParticleInfo PARTICLE_INFOS[] = {
-    {SAND, "Sable", Color(0.96f, 0.64f, 0.38f)},
-    {WATER, "Eau", Color(0.0f, 0.62f, 1.0f)},
-    {ROCK, "Roche", Color(0.41f, 0.41f, 0.44f)},
-    {SMOKE, "Fumee", Color(0.30f, 0.31f, 0.34f)},
-    {FIRE, "Feu", Color(1.0f, 0.32f, 0.03f)},
-    {WOOD, "Bois", Color(0.46f, 0.22f, 0.06f)},
-    {LAVA, "Lave", Color(1.0f, 0.16f, 0.01f)},
-    {ACID, "Acide", Color(0.42f, 0.95f, 0.03f)},
-    {OIL, "Huile", Color(0.24f, 0.17f, 0.04f)},
-    {STEAM, "Vapeur", Color(0.72f, 0.84f, 0.92f)},
-    {EMPTY, "Effacer", Color(0.12f, 0.12f, 0.14f)},
-};
-
-constexpr int PARTICLE_INFO_COUNT = static_cast<int>(sizeof(PARTICLE_INFOS) / sizeof(PARTICLE_INFOS[0]));
-
-const char *particle_name(Particle type) {
-    for (const ParticleInfo &info : PARTICLE_INFOS) {
-        if (info.type == type) {
-            return info.name;
+    // Style boutons
+    Ref<StyleBoxFlat> make_button_style(const Color& base, bool selected, float lighten) {
+        Ref<StyleBoxFlat> style;
+        style.instantiate();
+        style->set_bg_color(selected ? base.lightened(0.28f + lighten) : base.lightened(lighten));
+        if (selected) {
+            style->set_border_width_all(3);
+            style->set_border_color(Color(1.0f, 1.0f, 1.0f));
         }
+        return style;
     }
-    return "Inconnu";
+
+    struct ParticleInfo {
+        Particle type;
+        const char* name;
+        Color color;
+    };
+
+    const ParticleInfo PARTICLE_INFOS[] = {
+        {SAND, "Sable", Color(0.96f, 0.64f, 0.38f)},
+        {WATER, "Eau", Color(0.0f, 0.62f, 1.0f)},
+        {ROCK, "Roche", Color(0.41f, 0.41f, 0.44f)},
+        {SMOKE, "Fumee", Color(0.30f, 0.31f, 0.34f)},
+        {FIRE, "Feu", Color(1.0f, 0.32f, 0.03f)},
+        {WOOD, "Bois", Color(0.46f, 0.22f, 0.06f)},
+        {LAVA, "Lave", Color(1.0f, 0.16f, 0.01f)},
+        {ACID, "Acide", Color(0.42f, 0.95f, 0.03f)},
+        {OIL, "Huile", Color(0.24f, 0.17f, 0.04f)},
+        {STEAM, "Vapeur", Color(0.72f, 0.84f, 0.92f)},
+        {EMPTY, "Effacer", Color(0.12f, 0.12f, 0.14f)},
+    };
+
+    constexpr int PARTICLE_INFO_COUNT = static_cast<int>(sizeof(PARTICLE_INFOS) / sizeof(PARTICLE_INFOS[0]));
+
+    const char* particle_name(Particle type) {
+        for (const ParticleInfo& info : PARTICLE_INFOS) {
+            if (info.type == type) {
+                return info.name;
+            }
+        }
+        return "Inconnu";
+    }
+
 }
 
-} // namespace
 
-// ===========================================================================
-// Cycle de vie
-// ===========================================================================
-
+// Constructeur grille
 FallingSandGrid::FallingSandGrid() {
     const size_t cell_count = static_cast<size_t>(WORLD_WIDTH) * WORLD_HEIGHT;
     grid.assign(cell_count, static_cast<uint8_t>(EMPTY));
@@ -212,27 +218,29 @@ FallingSandGrid::FallingSandGrid() {
 
 FallingSandGrid::~FallingSandGrid() = default;
 
+// Exposition Godot
 void FallingSandGrid::_bind_methods() {
     ClassDB::bind_method(D_METHOD("on_particle_button_pressed", "particle_type"),
-                         &FallingSandGrid::on_particle_button_pressed);
+        &FallingSandGrid::on_particle_button_pressed);
     ClassDB::bind_method(D_METHOD("on_fps_button_pressed"),
-                         &FallingSandGrid::on_fps_button_pressed);
+        &FallingSandGrid::on_fps_button_pressed);
     ClassDB::bind_method(D_METHOD("_simulate_chunk", "list_index"),
-                         &FallingSandGrid::_simulate_chunk);
+        &FallingSandGrid::_simulate_chunk);
 }
 
+// Création de la scène
 void FallingSandGrid::_ready() {
-    // Simulation fixe, indÃ©pendante du nombre d'images affichÃ©es.
+
     Engine::get_singleton()->set_physics_ticks_per_second(60);
 
-    // Le rendu dÃ©marre Ã  60 FPS. Le bouton permet ensuite de le dÃ©plafonner.
+
     Engine::get_singleton()->set_max_fps(60);
     DisplayServer::get_singleton()->window_set_vsync_mode(
-            DisplayServer::VSYNC_DISABLED);
+        DisplayServer::VSYNC_DISABLED);
     fps_uncapped = false;
 
     DisplayServer::get_singleton()->window_set_size(
-            Vector2i(WORLD_WIDTH * CELL_SIZE, WORLD_HEIGHT * CELL_SIZE + UI_HEIGHT));
+        Vector2i(WORLD_WIDTH * CELL_SIZE, WORLD_HEIGHT * CELL_SIZE + UI_HEIGHT));
 
     pixel_bytes.resize(static_cast<int64_t>(WORLD_WIDTH) * WORLD_HEIGHT);
     image = Image::create_from_data(WORLD_WIDTH, WORLD_HEIGHT, false, Image::FORMAT_R8, pixel_bytes);
@@ -251,6 +259,7 @@ void FallingSandGrid::_ready() {
     render_grid();
 }
 
+// Config shader
 void FallingSandGrid::setup_material() {
     Ref<Shader> shader;
     shader.instantiate();
@@ -262,9 +271,6 @@ void FallingSandGrid::setup_material() {
     sprite->set_material(material);
 }
 
-// ===========================================================================
-// Proprietes des materiaux
-// ===========================================================================
 
 bool FallingSandGrid::is_solid(Particle type) {
     return type == ROCK || type == WOOD;
@@ -282,33 +288,36 @@ bool FallingSandGrid::is_flammable(Particle type) {
     return type == WOOD || type == OIL;
 }
 
+// Densité
 int FallingSandGrid::density(Particle type) {
     switch (type) {
-        case EMPTY: return -1000;
-        case FIRE: return -40;
-        case SMOKE: return -30;
-        case STEAM: return -20;
-        case OIL: return 10;
-        case WATER: return 20;
-        case ACID: return 26;
-        case LAVA: return 32;
-        case SAND: return 50;
-        case ROCK:
-        case WOOD: return 10000;
-        default: return 0;
+    case EMPTY: return -1000;
+    case FIRE: return -40;
+    case SMOKE: return -30;
+    case STEAM: return -20;
+    case OIL: return 10;
+    case WATER: return 20;
+    case ACID: return 26;
+    case LAVA: return 32;
+    case SAND: return 50;
+    case ROCK:
+    case WOOD: return 10000;
+    default: return 0;
     }
 }
 
+// Dispersion liquide
 int FallingSandGrid::liquid_dispersion(Particle type) {
     switch (type) {
-        case WATER: return WATER_DISPERSION;
-        case OIL: return OIL_DISPERSION;
-        case ACID: return ACID_DISPERSION;
-        case LAVA: return LAVA_DISPERSION;
-        default: return 1;
+    case WATER: return WATER_DISPERSION;
+    case OIL: return OIL_DISPERSION;
+    case ACID: return ACID_DISPERSION;
+    case LAVA: return LAVA_DISPERSION;
+    default: return 1;
     }
 }
 
+// Traverser matériau ?
 bool FallingSandGrid::can_sink_into(Particle moving, Particle target) const {
     if (target == EMPTY) {
         return true;
@@ -319,6 +328,7 @@ bool FallingSandGrid::can_sink_into(Particle moving, Particle target) const {
     return density(target) < density(moving);
 }
 
+// Traverser haut ?
 bool FallingSandGrid::can_gas_rise_into(Particle moving, Particle target) const {
     if (target == EMPTY) {
         return true;
@@ -326,32 +336,31 @@ bool FallingSandGrid::can_gas_rise_into(Particle moving, Particle target) const 
     return is_gas(target) && target != moving && density(target) > density(moving);
 }
 
+// Durée de vie
 uint8_t FallingSandGrid::initial_cell_data(Particle type) const {
     switch (type) {
-        case FIRE: return rng_u8(48, 92);
-        case SMOKE: return rng_u8(100, 190);
-        case STEAM: return rng_u8(75, 145);
-        case WATER:
-        case LAVA:
-        case ACID:
-        case OIL: return LIQUID_SETTLE_FRAMES;
-        default: return 0;
+    case FIRE: return rng_u8(48, 92);
+    case SMOKE: return rng_u8(100, 190);
+    case STEAM: return rng_u8(75, 145);
+    case WATER:
+    case LAVA:
+    case ACID:
+    case OIL: return LIQUID_SETTLE_FRAMES;
+    default: return 0;
     }
 }
 
-// ===========================================================================
-// Boucle principale et chunks
-// ===========================================================================
 
+// MAJ physique
 void FallingSandGrid::_physics_process(double p_delta) {
     (void)p_delta;
 
-    // Cette partie tourne exactement 60 fois par seconde.
+
     begin_frame();
     run_simulation();
 
-    // Les sous-pas liquides sont conservÃ©s : ils sont maintenant eux aussi
-    // exÃ©cutÃ©s Ã  une frÃ©quence stable, indÃ©pendante du FPS de rendu.
+
+
     for (int substep = 1; substep < LIQUID_SUBSTEPS; ++substep) {
         begin_frame(false);
         liquids_only = true;
@@ -360,26 +369,28 @@ void FallingSandGrid::_physics_process(double p_delta) {
     }
 }
 
+// Rendu image
 void FallingSandGrid::_process(double p_delta) {
     (void)p_delta;
 
-    // Le rendu peut Ãªtre plafonnÃ© Ã  60 FPS ou laissÃ© sans limite.
+
     render_grid();
     update_stats();
     queue_redraw();
 }
 
+// Préparation des chunks
 void FallingSandGrid::begin_frame(bool p_reset_working) {
     active_chunk_count = 0;
     dirty_cell_count = 0;
-    for (std::vector<int> &list : pass_lists) {
+    for (std::vector<int>& list : pass_lists) {
         list.clear();
     }
     debug_chunk_rects.clear();
     debug_dirty_rects.clear();
 
     for (int chunk_index = 0; chunk_index < NUM_CHUNKS; ++chunk_index) {
-        Chunk &chunk = chunks[chunk_index];
+        Chunk& chunk = chunks[chunk_index];
 
         chunk.min_x = chunk.w_min_x.load(std::memory_order_relaxed);
         chunk.min_y = chunk.w_min_y.load(std::memory_order_relaxed);
@@ -394,7 +405,7 @@ void FallingSandGrid::begin_frame(bool p_reset_working) {
         }
 
         for (int y = chunk.min_y; y <= chunk.max_y; ++y) {
-            uint8_t *row = grid.data() + static_cast<size_t>(y) * WORLD_WIDTH;
+            uint8_t* row = grid.data() + static_cast<size_t>(y) * WORLD_WIDTH;
             for (int x = chunk.min_x; x <= chunk.max_x; ++x) {
                 row[x] &= TYPE_MASK;
             }
@@ -406,21 +417,22 @@ void FallingSandGrid::begin_frame(bool p_reset_working) {
 
         ++active_chunk_count;
         dirty_cell_count += static_cast<int64_t>(chunk.max_x - chunk.min_x + 1) *
-                            (chunk.max_y - chunk.min_y + 1);
+            (chunk.max_y - chunk.min_y + 1);
 
         if (debug_overlay) {
             debug_chunk_rects.emplace_back(
-                    chunk_x * CHUNK_SIZE, chunk_y * CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE);
+                chunk_x * CHUNK_SIZE, chunk_y * CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE);
             debug_dirty_rects.emplace_back(
-                    chunk.min_x, chunk.min_y,
-                    chunk.max_x - chunk.min_x + 1,
-                    chunk.max_y - chunk.min_y + 1);
+                chunk.min_x, chunk.min_y,
+                chunk.max_x - chunk.min_x + 1,
+                chunk.max_y - chunk.min_y + 1);
         }
     }
 }
 
+// Multithread
 void FallingSandGrid::run_simulation() {
-    WorkerThreadPool *thread_pool = WorkerThreadPool::get_singleton();
+    WorkerThreadPool* thread_pool = WorkerThreadPool::get_singleton();
 
     for (int pass = 0; pass < NUM_PASSES; ++pass) {
         if (pass_lists[pass].empty()) {
@@ -430,11 +442,12 @@ void FallingSandGrid::run_simulation() {
 
         if (use_threads && pass_lists[pass].size() > 1 && thread_pool != nullptr) {
             const int64_t group_id = thread_pool->add_group_task(
-                    Callable(this, "_simulate_chunk"),
-                    static_cast<int32_t>(pass_lists[pass].size()),
-                    -1, true, "FallingSand");
+                Callable(this, "_simulate_chunk"),
+                static_cast<int32_t>(pass_lists[pass].size()),
+                -1, true, "FallingSand");
             thread_pool->wait_for_group_task_completion(group_id);
-        } else {
+        }
+        else {
             for (int list_index = 0; list_index < static_cast<int>(pass_lists[pass].size()); ++list_index) {
                 _simulate_chunk(list_index);
             }
@@ -442,15 +455,17 @@ void FallingSandGrid::run_simulation() {
     }
 }
 
+// Simulation chunk
 void FallingSandGrid::_simulate_chunk(int list_index) {
-    const std::vector<int> &list = pass_lists[current_pass];
+    const std::vector<int>& list = pass_lists[current_pass];
     if (list_index < 0 || list_index >= static_cast<int>(list.size())) {
         return;
     }
     simulate_chunk_cells(chunks[list[list_index]]);
 }
 
-void FallingSandGrid::simulate_chunk_cells(const Chunk &chunk) {
+// Parcours des cellules
+void FallingSandGrid::simulate_chunk_cells(const Chunk& chunk) {
     for (int y = chunk.max_y; y >= chunk.min_y; --y) {
         const bool left_to_right = rng_bool();
         const int x_start = left_to_right ? chunk.min_x : chunk.max_x;
@@ -468,33 +483,31 @@ void FallingSandGrid::simulate_chunk_cells(const Chunk &chunk) {
                 continue;
             }
             switch (type) {
-                case SAND:
-                    move_sand(x, y);
-                    break;
-                case WATER:
-                case LAVA:
-                case ACID:
-                case OIL:
-                    move_liquid(x, y, type);
-                    break;
-                case SMOKE:
-                case STEAM:
-                    move_smoke_or_steam(x, y, type);
-                    break;
-                case FIRE:
-                    move_fire(x, y);
-                    break;
-                default:
-                    break;
+            case SAND:
+                move_sand(x, y);
+                break;
+            case WATER:
+            case LAVA:
+            case ACID:
+            case OIL:
+                move_liquid(x, y, type);
+                break;
+            case SMOKE:
+            case STEAM:
+                move_smoke_or_steam(x, y, type);
+                break;
+            case FIRE:
+                move_fire(x, y);
+                break;
+            default:
+                break;
             }
         }
     }
 }
 
-// ===========================================================================
-// Ecriture, deplacement et reveil
-// ===========================================================================
 
+// Écriture d'une cellule
 void FallingSandGrid::set_cell(int x, int y, Particle type, uint8_t data, bool updated) {
     if (!in_world(x, y)) {
         return;
@@ -509,6 +522,7 @@ void FallingSandGrid::set_cell(int x, int y, Particle type, uint8_t data, bool u
     mark_dirty(x, y);
 }
 
+// Déplacement ou échange
 void FallingSandGrid::move_cell(int x1, int y1, int x2, int y2) {
     const int source_index = get_index(x1, y1);
     const int target_index = get_index(x2, y2);
@@ -524,7 +538,8 @@ void FallingSandGrid::move_cell(int x1, int y1, int x2, int y2) {
     if (target_type == EMPTY) {
         grid[source_index] = static_cast<uint8_t>(EMPTY);
         cell_data[source_index] = 0;
-    } else {
+    }
+    else {
         grid[source_index] = static_cast<uint8_t>(target_type) | UPDATED_BIT;
         cell_data[source_index] = target_data;
     }
@@ -540,6 +555,7 @@ void FallingSandGrid::move_cell(int x1, int y1, int x2, int y2) {
     mark_dirty(x2, y2);
 }
 
+// Maintien du liquide actif
 void FallingSandGrid::keep_liquid_awake(int x, int y) {
     const int index = get_index(x, y);
     if (cell_data[index] > 0) {
@@ -548,6 +564,7 @@ void FallingSandGrid::keep_liquid_awake(int x, int y) {
     }
 }
 
+// Activation des chunks
 void FallingSandGrid::mark_dirty(int x, int y, int radius_x, int radius_y) {
     const int x0 = std::max(x - radius_x, 0);
     const int x1 = std::min(x + radius_x, WORLD_WIDTH - 1);
@@ -561,7 +578,7 @@ void FallingSandGrid::mark_dirty(int x, int y, int radius_x, int radius_y) {
 
     for (int chunk_y = chunk_y0; chunk_y <= chunk_y1; ++chunk_y) {
         for (int chunk_x = chunk_x0; chunk_x <= chunk_x1; ++chunk_x) {
-            Chunk &chunk = chunks[chunk_y * CHUNKS_X + chunk_x];
+            Chunk& chunk = chunks[chunk_y * CHUNKS_X + chunk_x];
             atomic_fetch_min(chunk.w_min_x, std::max(x0, chunk_x * CHUNK_SIZE));
             atomic_fetch_min(chunk.w_min_y, std::max(y0, chunk_y * CHUNK_SIZE));
             atomic_fetch_max(chunk.w_max_x, std::min(x1, (chunk_x + 1) * CHUNK_SIZE - 1));
@@ -570,10 +587,8 @@ void FallingSandGrid::mark_dirty(int x, int y, int radius_x, int radius_y) {
     }
 }
 
-// ===========================================================================
-// Sable et liquides
-// ===========================================================================
 
+// Déplacement sable
 void FallingSandGrid::move_sand(int x, int y) {
     if (y + 1 >= WORLD_HEIGHT) {
         return;
@@ -601,6 +616,7 @@ void FallingSandGrid::move_sand(int x, int y) {
     }
 }
 
+// Recherche latérale liquide
 FallingSandGrid::FlowCandidate FallingSandGrid::scan_liquid_side(
     int x,
     int y,
@@ -622,8 +638,6 @@ FallingSandGrid::FlowCandidate FallingSandGrid::scan_liquid_side(
 
         const Particle target = cell_type(target_x, y);
 
-        // On autorise la recherche Ã  travers une masse du mÃªme liquide.
-        // Cela simule une propagation de pression horizontale.
         if (target == type) {
             crossed_same_liquid = true;
             continue;
@@ -638,45 +652,34 @@ FallingSandGrid::FlowCandidate FallingSandGrid::scan_liquid_side(
                 candidate.has_drop = true;
             }
 
-            // AprÃ¨s avoir traversÃ© le mÃªme liquide, on prend le premier
-            // espace disponible : cela pousse la masse vers son bord.
             if (candidate.has_drop) {
                 break;
             }
 
             if (crossed_same_liquid) {
-                // La pression latÃ©rale ne s'applique qu'environ une fois sur deux.
                 if (rng_bool()) {
                     break;
                 }
-
-                // Cette frame, la masse ne transmet pas sa pression.
                 candidate.x = x;
                 candidate.distance = 0;
                 candidate.has_drop = false;
                 break;
             }
-
-            // Dans un couloir dÃ©jÃ  vide, on peut continuer Ã  chercher
-            // une destination plus Ã©loignÃ©e.
             continue;
         }
 
-        // Ã‰change direct avec un liquide moins dense.
         if (distance == 1 && can_sink_into(type, target)) {
             candidate.x = target_x;
             candidate.distance = 1;
         }
-
         break;
     }
 
     return candidate;
 }
 
+// Écoulement du liquide
 void FallingSandGrid::move_liquid(int x, int y, Particle type) {
-    // Les reactions ne tournent que sur la passe principale : les rejouer a
-    // chaque sous-pas multiplierait leurs probabilites par LIQUID_SUBSTEPS.
     if (!liquids_only) {
         if (type == WATER && process_water_reactions(x, y)) {
             return;
@@ -716,18 +719,22 @@ void FallingSandGrid::move_liquid(int x, int y, Particle type) {
     const FlowCandidate left = scan_liquid_side(x, y, type, -1, dispersion);
     const FlowCandidate right = scan_liquid_side(x, y, type, 1, dispersion);
 
-    const FlowCandidate *chosen = nullptr;
+    const FlowCandidate* chosen = nullptr;
     if (left.has_drop != right.has_drop) {
         chosen = left.has_drop ? &left : &right;
-    } else if (left.has_drop && right.has_drop) {
+    }
+    else if (left.has_drop && right.has_drop) {
         if (left.distance == right.distance) {
             chosen = rng_bool() ? &left : &right;
-        } else {
+        }
+        else {
             chosen = (left.distance < right.distance) ? &left : &right;
         }
-    } else if (left.distance != right.distance) {
+    }
+    else if (left.distance != right.distance) {
         chosen = (left.distance > right.distance) ? &left : &right;
-    } else if (left.distance > 0) {
+    }
+    else if (left.distance > 0) {
         chosen = rng_bool() ? &left : &right;
     }
 
@@ -735,17 +742,11 @@ void FallingSandGrid::move_liquid(int x, int y, Particle type) {
         move_cell(x, y, chosen->x, y);
         return;
     }
-
-    // Une cellule liquide immobile continue d'etre testee quelques frames.
-    // Cela evite qu'une flaque se fige prematurement sur les frontieres des
-    // dirty rects, tout en permettant au chunk de s'endormir ensuite.
     keep_liquid_awake(x, y);
 }
 
-// ===========================================================================
-// Gaz, vapeur et feu
-// ===========================================================================
 
+// Montée et dispersion du gaz
 bool FallingSandGrid::try_move_gas(int x, int y, Particle type, int horizontal_dispersion) {
     if (y > 0 && can_gas_rise_into(type, cell_type(x, y - 1))) {
         move_cell(x, y, x, y - 1);
@@ -792,9 +793,11 @@ bool FallingSandGrid::try_move_gas(int x, int y, Particle type, int horizontal_d
     int target_x = x;
     if (available_left == available_right) {
         target_x += rng_bool() ? available_right : -available_left;
-    } else if (available_left > available_right) {
+    }
+    else if (available_left > available_right) {
         target_x -= available_left;
-    } else {
+    }
+    else {
         target_x += available_right;
     }
 
@@ -802,6 +805,7 @@ bool FallingSandGrid::try_move_gas(int x, int y, Particle type, int horizontal_d
     return true;
 }
 
+// Déplacement et durée du gaz
 void FallingSandGrid::move_smoke_or_steam(int x, int y, Particle type) {
     const int index = get_index(x, y);
     uint8_t life = cell_data[index];
@@ -812,7 +816,8 @@ void FallingSandGrid::move_smoke_or_steam(int x, int y, Particle type) {
     if (life <= 1) {
         if (type == STEAM && rng_chance(1, 3)) {
             set_cell(x, y, WATER, LIQUID_SETTLE_FRAMES, true);
-        } else {
+        }
+        else {
             set_cell(x, y, EMPTY, 0, false);
         }
         return;
@@ -820,11 +825,12 @@ void FallingSandGrid::move_smoke_or_steam(int x, int y, Particle type) {
 
     cell_data[index] = static_cast<uint8_t>(life - 1);
     if (!try_move_gas(x, y, type, GAS_DISPERSION)) {
-        // Un gaz bloque doit rester actif pour vieillir, puis mourir.
+
         mark_dirty(x, y);
     }
 }
 
+// Propagation et durée du feu
 void FallingSandGrid::move_fire(int x, int y) {
     if (process_fire_reactions(x, y)) {
         return;
@@ -847,10 +853,8 @@ void FallingSandGrid::move_fire(int x, int y) {
     }
 }
 
-// ===========================================================================
-// Reactions
-// ===========================================================================
 
+// Extinction par l'eau
 bool FallingSandGrid::process_water_reactions(int x, int y) {
     bool extinguished_fire = false;
 
@@ -878,8 +882,8 @@ bool FallingSandGrid::process_water_reactions(int x, int y) {
     return extinguished_fire;
 }
 
+// Combustion des matériaux
 bool FallingSandGrid::process_fire_reactions(int x, int y) {
-    // L'eau eteint immediatement le feu : la cellule de feu devient vapeur.
     for (int offset_y = -1; offset_y <= 1; ++offset_y) {
         for (int offset_x = -1; offset_x <= 1; ++offset_x) {
             if (offset_x == 0 && offset_y == 0) {
@@ -894,7 +898,7 @@ bool FallingSandGrid::process_fire_reactions(int x, int y) {
         }
     }
 
-    // Le feu enflamme le bois lentement et l'huile beaucoup plus vite.
+
     for (int offset_y = -1; offset_y <= 1; ++offset_y) {
         for (int offset_x = -1; offset_x <= 1; ++offset_x) {
             if (offset_x == 0 && offset_y == 0) {
@@ -918,9 +922,9 @@ bool FallingSandGrid::process_fire_reactions(int x, int y) {
     return false;
 }
 
+// Réactions de la lave
 bool FallingSandGrid::process_lava_reactions(int x, int y) {
     bool reacted = false;
-
     for (int offset_y = -1; offset_y <= 1; ++offset_y) {
         for (int offset_x = -1; offset_x <= 1; ++offset_x) {
             if (offset_x == 0 && offset_y == 0) {
@@ -934,11 +938,12 @@ bool FallingSandGrid::process_lava_reactions(int x, int y) {
 
             const Particle neighbor = cell_type(neighbor_x, neighbor_y);
             if (neighbor == WATER) {
-                // La lave mineralise l'eau au contact et libere de la vapeur.
+
                 set_cell(neighbor_x, neighbor_y, ROCK, 0, true);
                 spawn_steam_near(neighbor_x, neighbor_y);
                 reacted = true;
-            } else if (is_flammable(neighbor) && rng_chance(1, 10)) {
+            }
+            else if (is_flammable(neighbor) && rng_chance(1, 10)) {
                 set_cell(neighbor_x, neighbor_y, FIRE, initial_cell_data(FIRE), true);
                 reacted = true;
             }
@@ -952,6 +957,7 @@ bool FallingSandGrid::process_lava_reactions(int x, int y) {
     return reacted;
 }
 
+// Dissolution par l'acide
 bool FallingSandGrid::process_acid_reactions(int x, int y) {
     const int start = static_cast<int>(rng_next() % 8u);
     static const int OFFSETS[8][2] = {
@@ -972,9 +978,11 @@ bool FallingSandGrid::process_acid_reactions(int x, int y) {
         bool dissolve = false;
         if (neighbor == WOOD) {
             dissolve = rng_chance(1, 10);
-        } else if (neighbor == SAND) {
+        }
+        else if (neighbor == SAND) {
             dissolve = rng_chance(1, 18);
-        } else if (neighbor == ROCK) {
+        }
+        else if (neighbor == ROCK) {
             dissolve = rng_chance(1, 55);
         }
 
@@ -982,17 +990,18 @@ bool FallingSandGrid::process_acid_reactions(int x, int y) {
             set_cell(neighbor_x, neighbor_y, EMPTY, 0, false);
             if (rng_chance(1, 12)) {
                 set_cell(x, y, EMPTY, 0, false);
-            } else {
+            }
+            else {
                 cell_data[get_index(x, y)] = LIQUID_SETTLE_FRAMES;
                 mark_dirty(x, y);
             }
             return true;
         }
     }
-
     return false;
 }
 
+// Création de vapeur
 void FallingSandGrid::spawn_steam_near(int x, int y) {
     static const int OFFSETS[8][2] = {
         {0, -1}, {-1, -1}, {1, -1},
@@ -1000,7 +1009,7 @@ void FallingSandGrid::spawn_steam_near(int x, int y) {
         {0, -2}, {-2, -1}, {2, -1}
     };
 
-    for (const auto &offset : OFFSETS) {
+    for (const auto& offset : OFFSETS) {
         const int target_x = x + offset[0];
         const int target_y = y + offset[1];
         if (in_world(target_x, target_y) && cell_type(target_x, target_y) == EMPTY) {
@@ -1010,51 +1019,51 @@ void FallingSandGrid::spawn_steam_near(int x, int y) {
     }
 }
 
-// ===========================================================================
-// Rendu et interface
-// ===========================================================================
 
+// MAJ texture
 void FallingSandGrid::render_grid() {
     std::memcpy(pixel_bytes.ptrw(), grid.data(), grid.size());
     image->set_data(WORLD_WIDTH, WORLD_HEIGHT, false, Image::FORMAT_R8, pixel_bytes);
     texture->update(image);
 }
 
+// Pinceau et debug chunks
 void FallingSandGrid::_draw() {
     const Vector2 mouse = get_local_mouse_position();
     if (mouse.y < static_cast<real_t>(WORLD_HEIGHT * CELL_SIZE)) {
         draw_arc(mouse, static_cast<real_t>(brush_radius * CELL_SIZE),
-                 0.0f, 6.2831853f, 48,
-                 Color(1.0f, 1.0f, 1.0f, 0.62f), 1.0f);
+            0.0f, 6.2831853f, 48,
+            Color(1.0f, 1.0f, 1.0f, 0.62f), 1.0f);
     }
 
     if (!debug_overlay) {
         return;
     }
 
-    for (const Rect2i &rect : debug_chunk_rects) {
+    for (const Rect2i& rect : debug_chunk_rects) {
         draw_rect(Rect2(
-                          static_cast<real_t>(rect.position.x * CELL_SIZE),
-                          static_cast<real_t>(rect.position.y * CELL_SIZE),
-                          static_cast<real_t>(rect.size.x * CELL_SIZE),
-                          static_cast<real_t>(rect.size.y * CELL_SIZE)),
-                  Color(1.0f, 1.0f, 0.0f, 0.35f), false, 1.0f);
+            static_cast<real_t>(rect.position.x * CELL_SIZE),
+            static_cast<real_t>(rect.position.y * CELL_SIZE),
+            static_cast<real_t>(rect.size.x * CELL_SIZE),
+            static_cast<real_t>(rect.size.y * CELL_SIZE)),
+            Color(1.0f, 1.0f, 0.0f, 0.35f), false, 1.0f);
     }
-    for (const Rect2i &rect : debug_dirty_rects) {
+    for (const Rect2i& rect : debug_dirty_rects) {
         draw_rect(Rect2(
-                          static_cast<real_t>(rect.position.x * CELL_SIZE),
-                          static_cast<real_t>(rect.position.y * CELL_SIZE),
-                          static_cast<real_t>(rect.size.x * CELL_SIZE),
-                          static_cast<real_t>(rect.size.y * CELL_SIZE)),
-                  Color(1.0f, 0.15f, 0.15f, 0.90f), false, 1.0f);
+            static_cast<real_t>(rect.position.x * CELL_SIZE),
+            static_cast<real_t>(rect.position.y * CELL_SIZE),
+            static_cast<real_t>(rect.size.x * CELL_SIZE),
+            static_cast<real_t>(rect.size.y * CELL_SIZE)),
+            Color(1.0f, 0.15f, 0.15f, 0.90f), false, 1.0f);
     }
 }
 
+// UI
 void FallingSandGrid::setup_ui() {
     ui_panel = memnew(Panel);
     ui_panel->set_position(Vector2(0, static_cast<real_t>(WORLD_HEIGHT * CELL_SIZE)));
     ui_panel->set_size(Vector2(static_cast<real_t>(WORLD_WIDTH * CELL_SIZE),
-                               static_cast<real_t>(UI_HEIGHT)));
+        static_cast<real_t>(UI_HEIGHT)));
     add_child(ui_panel);
 
     constexpr int columns = 6;
@@ -1069,51 +1078,50 @@ void FallingSandGrid::setup_ui() {
         const int column = index % columns;
         const int row = index / columns;
 
-        Button *button = memnew(Button);
+        Button* button = memnew(Button);
         button->set_text(PARTICLE_INFOS[index].name);
         button->set_position(Vector2(
-                static_cast<real_t>(start_x + column * (button_width + horizontal_gap)),
-                static_cast<real_t>(start_y + row * (button_height + vertical_gap))));
+            static_cast<real_t>(start_x + column * (button_width + horizontal_gap)),
+            static_cast<real_t>(start_y + row * (button_height + vertical_gap))));
         button->set_size(Vector2(static_cast<real_t>(button_width),
-                                 static_cast<real_t>(button_height)));
+            static_cast<real_t>(button_height)));
         button->set_mouse_filter(Control::MOUSE_FILTER_STOP);
         button->connect("pressed",
-                        Callable(this, "on_particle_button_pressed")
-                                .bind(static_cast<int>(PARTICLE_INFOS[index].type)));
+            Callable(this, "on_particle_button_pressed")
+            .bind(static_cast<int>(PARTICLE_INFOS[index].type)));
 
         ui_panel->add_child(button);
         ui_buttons[PARTICLE_INFOS[index].type] = button;
     }
 
-    // Les 11 matÃ©riaux utilisent 11 cases sur une grille de 6 x 2.
-    // Le bouton FPS occupe la douziÃ¨me case libre.
     fps_button = memnew(Button);
     fps_button->set_position(Vector2(
-            static_cast<real_t>(start_x + 5 * (button_width + horizontal_gap)),
-            static_cast<real_t>(start_y + button_height + vertical_gap)));
+        static_cast<real_t>(start_x + 5 * (button_width + horizontal_gap)),
+        static_cast<real_t>(start_y + button_height + vertical_gap)));
     fps_button->set_size(Vector2(
-            static_cast<real_t>(button_width),
-            static_cast<real_t>(button_height)));
+        static_cast<real_t>(button_width),
+        static_cast<real_t>(button_height)));
     fps_button->set_mouse_filter(Control::MOUSE_FILTER_STOP);
     fps_button->connect(
-            "pressed",
-            Callable(this, "on_fps_button_pressed"));
+        "pressed",
+        Callable(this, "on_fps_button_pressed"));
     ui_panel->add_child(fps_button);
     update_fps_button();
 
     stats_label = memnew(Label);
     stats_label->set_position(Vector2(748.0f, 8.0f));
     stats_label->set_size(Vector2(
-            static_cast<real_t>(WORLD_WIDTH * CELL_SIZE - 760),
-            static_cast<real_t>(UI_HEIGHT - 12)));
+        static_cast<real_t>(WORLD_WIDTH * CELL_SIZE - 760),
+        static_cast<real_t>(UI_HEIGHT - 12)));
     ui_panel->add_child(stats_label);
 
     update_button_styles();
 }
 
+// Boutons
 void FallingSandGrid::update_button_styles() {
-    for (const ParticleInfo &info : PARTICLE_INFOS) {
-        Button *button = ui_buttons[info.type];
+    for (const ParticleInfo& info : PARTICLE_INFOS) {
+        Button* button = ui_buttons[info.type];
         const bool selected = info.type == selected_particle;
         button->add_theme_stylebox_override("normal", make_button_style(info.color, selected, 0.0f));
         button->add_theme_stylebox_override("hover", make_button_style(info.color, selected, 0.13f));
@@ -1121,6 +1129,7 @@ void FallingSandGrid::update_button_styles() {
     }
 }
 
+// Stats
 void FallingSandGrid::update_stats() {
     if (stats_label == nullptr) {
         return;
@@ -1136,47 +1145,43 @@ void FallingSandGrid::update_stats() {
     String text;
     text += String("FPS: ") + String::num_int64(static_cast<int64_t>(std::lround(fps)));
     text += String("  |  Chunks: ") + String::num_int64(active_chunk_count) +
-            String("/") + String::num_int64(NUM_CHUNKS);
+        String("/") + String::num_int64(NUM_CHUNKS);
     text += String("  |  Cellules: ") + String::num_int64(dirty_cell_count);
     text += String("  |  Threads: ") + String(use_threads ? "ON" : "OFF");
     text += String("  |  Simulation: 60 TPS");
     text += String("  |  Rendu: ") + String(fps_uncapped ? "UNCAP" : "60 FPS");
     text += String("  |  Sim: 60 TPS");
     text += String("  |  Rendu: ") +
-            String(fps_uncapped ? "UNCAP" : "60 FPS");
+        String(fps_uncapped ? "UNCAP" : "60 FPS");
     text += String("\nMateriau: ") + String(particle_name(selected_particle));
     text += String("  |  Pinceau: ") + String::num_int64(brush_radius);
     text += String("  |  [D] chunks  [T] threads  [C] effacer  [Molette] taille");
     stats_label->set_text(text);
 }
 
+// Selection matériau
 void FallingSandGrid::on_particle_button_pressed(int particle_type) {
     selected_particle = static_cast<Particle>(particle_type);
     update_button_styles();
 }
 
+// FPS
 void FallingSandGrid::on_fps_button_pressed() {
     fps_uncapped = !fps_uncapped;
-
-    // Une valeur de 0 dÃ©sactive le plafond du rendu.
-    // _physics_process reste nÃ©anmoins fixÃ© Ã  60 ticks par seconde.
     Engine::get_singleton()->set_max_fps(fps_uncapped ? 0 : 60);
     update_fps_button();
 }
 
+// Bouton FPS
 void FallingSandGrid::update_fps_button() {
     if (fps_button == nullptr) {
         return;
     }
-
     fps_button->set_text(
-            fps_uncapped ? "FPS : UNCAP" : "FPS : 60");
+        fps_uncapped ? "FPS : UNCAP" : "FPS : 60");
 }
 
-// ===========================================================================
-// Interaction
-// ===========================================================================
-
+// Entrées souris
 void FallingSandGrid::_unhandled_input(const Ref<InputEvent>& event) {
     Ref<InputEventMouseButton> mouse_button = event;
     if (mouse_button.is_valid()) {
@@ -1186,14 +1191,17 @@ void FallingSandGrid::_unhandled_input(const Ref<InputEvent>& event) {
                 const Vector2i cell = mouse_to_cell();
                 paint_at(cell);
                 last_paint_cell = cell;
-            } else {
+            }
+            else {
                 painting = false;
             }
-        } else if (mouse_button->is_pressed() &&
-                   mouse_button->get_button_index() == MOUSE_BUTTON_WHEEL_UP) {
+        }
+        else if (mouse_button->is_pressed() &&
+            mouse_button->get_button_index() == MOUSE_BUTTON_WHEEL_UP) {
             brush_radius = std::min(brush_radius + 1, 40);
-        } else if (mouse_button->is_pressed() &&
-                   mouse_button->get_button_index() == MOUSE_BUTTON_WHEEL_DOWN) {
+        }
+        else if (mouse_button->is_pressed() &&
+            mouse_button->get_button_index() == MOUSE_BUTTON_WHEEL_DOWN) {
             brush_radius = std::max(brush_radius - 1, 1);
         }
         return;
@@ -1214,21 +1222,25 @@ void FallingSandGrid::_unhandled_input(const Ref<InputEvent>& event) {
         const Key keycode = key->get_keycode();
         if (keycode == KEY_D) {
             debug_overlay = !debug_overlay;
-        } else if (keycode == KEY_T) {
+        }
+        else if (keycode == KEY_T) {
             use_threads = !use_threads;
-        } else if (keycode == KEY_C) {
+        }
+        else if (keycode == KEY_C) {
             clear_world();
         }
     }
 }
 
+// Souris vers cellule
 Vector2i FallingSandGrid::mouse_to_cell() const {
     const Vector2 mouse = get_local_mouse_position();
     return Vector2i(
-            static_cast<int>(std::floor(mouse.x / static_cast<float>(CELL_SIZE))),
-            static_cast<int>(std::floor(mouse.y / static_cast<float>(CELL_SIZE))));
+        static_cast<int>(std::floor(mouse.x / static_cast<float>(CELL_SIZE))),
+        static_cast<int>(std::floor(mouse.y / static_cast<float>(CELL_SIZE))));
 }
 
+// Cerlce peinture
 void FallingSandGrid::paint_at(Vector2i cell) {
     const int radius_squared = brush_radius * brush_radius;
 
@@ -1252,6 +1264,7 @@ void FallingSandGrid::paint_at(Vector2i cell) {
     }
 }
 
+// Interpolation du pinceau
 void FallingSandGrid::paint_line(Vector2i from, Vector2i to) {
     const int steps = std::max(std::abs(to.x - from.x), std::abs(to.y - from.y));
     if (steps == 0) {
@@ -1262,12 +1275,13 @@ void FallingSandGrid::paint_line(Vector2i from, Vector2i to) {
     for (int step = 0; step <= steps; ++step) {
         const float ratio = static_cast<float>(step) / static_cast<float>(steps);
         const Vector2i point(
-                static_cast<int>(std::lround(from.x + (to.x - from.x) * ratio)),
-                static_cast<int>(std::lround(from.y + (to.y - from.y) * ratio)));
+            static_cast<int>(std::lround(from.x + (to.x - from.x) * ratio)),
+            static_cast<int>(std::lround(from.y + (to.y - from.y) * ratio)));
         paint_at(point);
     }
 }
 
+// Réinitialisation du monde
 void FallingSandGrid::clear_world() {
     std::fill(grid.begin(), grid.end(), static_cast<uint8_t>(EMPTY));
     std::fill(cell_data.begin(), cell_data.end(), 0);
@@ -1280,4 +1294,3 @@ void FallingSandGrid::clear_world() {
         chunks[chunk_index].max_y = -1;
     }
 }
-
